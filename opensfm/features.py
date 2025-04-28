@@ -600,8 +600,8 @@ def extract_features_disk(
                        pad_if_not_divisible=True)
     
     # Extract keypoints and descriptors from features
-    keypoints = features["keypoints"][0].cpu().numpy()
-    descriptors = features["descriptors"][0].cpu().numpy()
+    keypoints = features[0].keypoints.cpu().numpy()
+    descriptors = features[0].descriptors.cpu().numpy()
 
     sizes = np.ones(keypoints.shape[0]) * config.get("disk_default_feature_size", 5.0)
     angles = np.zeros(keypoints.shape[0])
