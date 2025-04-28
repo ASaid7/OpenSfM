@@ -433,6 +433,23 @@ def _match_descriptors_impl(
             matches = match_brute_force_symmetric(d1, d2, overriden_config)
         else:
             matches = match_brute_force(d1, d2, overriden_config)
+    elif matcher_type == "LIGHTGLUE":
+        if symmetric_matching:
+            matches = match_lightglue_symmetric(
+                d1,
+                d2,
+                features_data1.points,
+                features_data2.points,
+                overriden_config,
+            )
+        else:
+            matches = match_lightglue(
+                d1,
+                d2,
+                features_data1.points,
+                features_data2.points,
+                overriden_config,
+            )
     else:
         raise ValueError("Invalid matcher_type: {}".format(matcher_type))
 
@@ -926,6 +943,118 @@ def unfilter_matches(matches, m1, m2) -> np.ndarray:
     i1 = np.flatnonzero(m1)
     i2 = np.flatnonzero(m2)
     return np.array([(i1[match[0]], i2[match[1]]) for match in matches])
+
+def match_lightglue(
+    d1: np.ndarray,
+    d2: np.ndarray,
+    p1: np.ndarray,
+    p2: np.ndarray,
+    config: Dict[str, Any],
+) -> List[Tuple[int, int]]:
+    """Match features using LightGlue from Kornia.
+    
+    Args:
+        d1, d2: Feature descriptors
+        p1, p2: Feature keypoints
+        config: Configuration parameters
+    
+    Returns:
+        List of matches as tuples (idx1, idx2)
+    """
+    try:
+        import torch
+        from kornia.feature import LightGlue
+    except ImportError:
+        logger.error("LightGlue matching requires Kornia and PyTorch. Please install them.")
+        return []
+    
+    # Check if CUDA is available
+    device = torch.device('cuda' if torch.cuda.is_available() and torch.cuda.is_initialized() else 'cpu')
+    
+    # Initialize LightGlue with the configured matcher
+    feature_type = config.get("lightglue_feature_type", "disk")
+    confidence_threshold = config.get("lightglue_confidence_threshold", 0.2)
+    
+    # Create LightGlue model
+    try:
+        lightglue = LightGlue(feature_type=feature_type)
+        lightglue = lightglue.to(device)
+        lightglue.eval()  # Set to evaluation mode
+    except Exception as e:
+        logger.error(f"Failed to initialize LightGlue model: {e}")
+        return []
+    
+    try:
+        # Convert the descriptors and keypoints to torch tensors
+        desc1 = torch.from_numpy(d1).to(device)
+        desc2 = torch.from_numpy(d2).to(device)
+        
+        kpts1 = torch.from_numpy(p1[:, :2]).to(device)
+        kpts2 = torch.from_numpy(p2[:, :2]).to(device)
+        
+        # Build feature dictionaries expected by LightGlue
+        feats0 = {
+            'keypoints': kpts1.float(),
+            'descriptors': desc1.float(),
+            'image_size': torch.tensor([p1.shape[0], p1.shape[0]]).to(device),  # Approximation
+        }
+        feats1 = {
+            'keypoints': kpts2.float(),
+            'descriptors': desc2.float(),
+            'image_size': torch.tensor([p2.shape[0], p2.shape[0]]).to(device),  # Approximation
+        }
+        
+        # Match features
+        with torch.no_grad():
+            matches_data = lightglue(feats0, feats1)
+        
+        # Extract indices and confidences
+        matches_idx = matches_data['matches']
+        confidences = matches_data['confidence']
+        
+        # Filter by confidence threshold
+        mask = confidences > confidence_threshold
+        filtered_matches = matches_idx[mask]
+        
+        # Convert to list of tuples
+        matches_list = [(i.item(), j.item()) for i, j in filtered_matches]
+        
+        # Clean up - move tensors back to CPU and free GPU memory
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+            
+        logger.debug(f"LightGlue found {len(matches_list)} matches out of {len(p1)} and {len(p2)} features")
+        return matches_list
+        
+    except Exception as e:
+        logger.error(f"Error during LightGlue matching: {e}")
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
+        return []
+
+def match_lightglue_symmetric(
+    d1: np.ndarray,
+    d2: np.ndarray,
+    p1: np.ndarray,
+    p2: np.ndarray,
+    config: Dict[str, Any],
+) -> List[Tuple[int, int]]:
+    """Match using LightGlue in both directions and keep consistent matches.
+    
+    Args:
+        d1, d2: Feature descriptors
+        p1, p2: Feature keypoints
+        config: Configuration parameters
+    
+    Returns:
+        List of matches as tuples (idx1, idx2)
+    """
+    matches_ij = match_lightglue(d1, d2, p1, p2, config)
+    matches_ji = match_lightglue(d2, d1, p2, p1, config)
+    matches_ij = [(a, b) for a, b in matches_ij]
+    matches_ji = [(b, a) for a, b in matches_ji]
+    
+    return list(set(matches_ij).intersection(set(matches_ji)))
 
 
 def apply_adhoc_filters(
