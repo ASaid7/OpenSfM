@@ -561,23 +561,14 @@ def extract_features_orb(
 def extract_features_disk(
     image: np.ndarray, config: Dict[str, Any], features_count: int
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Extract DISK features from an image.
+    global _disk_model_cache
     
-    Args:
-        image: Input image as a numpy array
-        config: OpenSfM configuration dictionary
-        features_count: Target number of features to extract
-        
-    Returns:
-        Tuple containing keypoints and descriptors
-    """
-
     # Get DISK-specific parameters from config
     disk_weights = config["disk_weights"]
     disk_num_features = config["disk_num_features"]
     disk_threshold = config["disk_threshold"]
-
-    # Ensure image is in the correct format for DISK
+    
+    # Prepare the image tensor
     if image.ndim == 2:  # grayscale image
         image_tensor = torch.from_numpy(image).float().unsqueeze(0).unsqueeze(0)
     else:  # RGB image
@@ -590,16 +581,23 @@ def extract_features_disk(
     device = torch.device('cuda' if torch.cuda.is_available() and config["use_gpu"] else 'cpu')
     image_tensor = image_tensor.to(device)
     
-    # Initialize DISK model
-    disk = KF.DISK.from_pretrained(disk_weights)
-    disk = disk.to(device)
+    # Initialize DISK model (with caching)
+    model_key = f"{disk_weights}_{device}"
+    if model_key not in _disk_model_cache:
+        logger.info(f"Loading DISK model {disk_weights} on {device}")
+        disk = KF.DISK.from_pretrained(disk_weights)
+        disk = disk.to(device)
+        _disk_model_cache[model_key] = disk
+    else:
+        disk = _disk_model_cache[model_key]
 
     # Extract features
     with torch.no_grad():
         disk.eval()
         features = disk(image_tensor, 
-                       num_features=disk_num_features if disk_num_features > 0 else features_count,
-                       detection_threshold=disk_threshold)
+                       n=disk_num_features if disk_num_features > 0 else features_count,
+                       score_threshold=disk_threshold,
+                       pad_if_not_divisible=True)
     
     # Extract keypoints and descriptors from features
     keypoints = features["keypoints"][0].cpu().numpy()
@@ -616,6 +614,10 @@ def extract_features_disk(
         idx = np.argsort(scores)[-features_count:]
         points = points[idx]
         descriptors = descriptors[idx]
+    
+    # Clean up GPU memory
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
     
     # Ensure consistency of output types with other extractors
     points = points.astype(float)

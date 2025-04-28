@@ -18,11 +18,22 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 def run_features_processing(data: DataSetBase, images: List[str], force: bool) -> None:
     """Main entry point for running features extraction on a list of images."""
+    # Check if we're using a GPU-based feature extractor
+    feature_type = data.config["feature_type"].upper()
+    is_gpu_feature = feature_type in ["DISK"] and data.config["use_gpu"]
+    
     default_queue_size = 10
     max_queue_size = 200
 
     mem_available = log.memory_available()
     processes = data.config["processes"]
+    
+    # For GPU features, force single-process mode
+    if is_gpu_feature:
+        logger.info(f"Using {feature_type} with GPU - forcing single process mode for stability")
+        processes = 1
+    
+    # Rest of the original function...
     if mem_available:
         # Use 90% of available memory
         ratio_use = 0.9
