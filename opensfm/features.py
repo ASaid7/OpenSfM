@@ -9,6 +9,9 @@ import cv2
 import numpy as np
 from opensfm import context, pyfeatures
 
+import torch
+import kornia as k
+import kornia.feature as KF
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -555,6 +558,70 @@ def extract_features_orb(
     logger.debug("Found {0} points in {1}s".format(len(points), time.time() - t))
     return points, desc
 
+def extract_features_disk(
+    image: np.ndarray, config: Dict[str, Any], features_count: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract DISK features from an image.
+    
+    Args:
+        image: Input image as a numpy array
+        config: OpenSfM configuration dictionary
+        features_count: Target number of features to extract
+        
+    Returns:
+        Tuple containing keypoints and descriptors
+    """
+
+    # Get DISK-specific parameters from config
+    disk_weights = config["disk_weights"]
+    disk_num_features = config["disk_num_features"]
+    disk_threshold = config["disk_threshold"]
+
+    # Ensure image is in the correct format for DISK
+    if image.ndim == 2:  # grayscale image
+        image_tensor = torch.from_numpy(image).float().unsqueeze(0).unsqueeze(0)
+    else:  # RGB image
+        # Convert to RGB and normalize
+        image_rgb = image.transpose(2, 0, 1)  # HWC to CHW
+        image_tensor = torch.from_numpy(image_rgb).float().unsqueeze(0)
+        image_tensor = image_tensor / 255.0
+    
+    # Move to GPU if available
+    device = torch.device('cuda' if torch.cuda.is_available() and config["use_gpu"] else 'cpu')
+    image_tensor = image_tensor.to(device)
+    
+    # Initialize DISK model
+    disk = KF.DISK.from_pretrained(disk_weights)
+    disk = disk.to(device)
+
+    # Extract features
+    with torch.no_grad():
+        disk.eval()
+        features = disk(image_tensor, 
+                       num_features=disk_num_features if disk_num_features > 0 else features_count,
+                       detection_threshold=disk_threshold)
+    
+    # Extract keypoints and descriptors from features
+    keypoints = features["keypoints"][0].cpu().numpy()
+    descriptors = features["descriptors"][0].cpu().numpy()
+
+    sizes = np.ones(keypoints.shape[0]) * config.get("disk_default_feature_size", 5.0)
+    angles = np.zeros(keypoints.shape[0])
+    
+    points = np.column_stack([keypoints, sizes[:, np.newaxis], angles[:, np.newaxis]])
+    
+    # If we have more keypoints than requested, sort by score (if available) and take top N
+    if "scores" in features and len(points) > features_count:
+        scores = features["scores"][0].cpu().numpy()
+        idx = np.argsort(scores)[-features_count:]
+        points = points[idx]
+        descriptors = descriptors[idx]
+    
+    # Ensure consistency of output types with other extractors
+    points = points.astype(float)
+    
+    return points, descriptors
+
 
 def extract_features(
     image: np.ndarray, config: Dict[str, Any], is_panorama: bool
@@ -614,9 +681,11 @@ def extract_features(
         points, desc = extract_features_hahog(image_gray, config, features_count)
     elif feature_type == "ORB":
         points, desc = extract_features_orb(image_gray, config, features_count)
+    elif feature_type == "DISK":
+        points, desc = extract_features_disk(image, config, features_count)
     else:
         raise ValueError(
-            "Unknown feature type (must be SURF, SIFT, AKAZE, HAHOG or ORB)"
+            "Unknown feature type (must be SURF, SIFT, AKAZE, HAHOG, ORB or DISK)"
         )
 
     xs = points[:, 0].round().astype(int)

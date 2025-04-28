@@ -19,7 +19,7 @@ class OpenSfMConfig:
     ##################################
     # Params for features
     ##################################
-    # Feature type (AKAZE, SURF, SIFT, HAHOG, ORB)
+    # Feature type (AKAZE, SURF, SIFT, HAHOG, ORB, DISK)
     feature_type: str = "HAHOG"
     # If true, apply square root mapping to features
     feature_root: bool = True
@@ -34,6 +34,20 @@ class OpenSfMConfig:
     feature_use_adaptive_suppression: bool = False
     # Bake segmentation info (class and instance) in the feature data. Thus it is done once for all at extraction time.
     features_bake_segmentation: bool = False
+
+    ##################################
+    # Params for DISK
+    ##################################
+    # Options: "depth", "epipolar", or a path to weights
+    disk_weights: str = "depth"  
+    # 0 means use feature_min_frames
+    disk_num_features: int = 0 
+    # Detection threshold
+    disk_threshold: float = 0.0
+    # Default size for detected features
+    disk_default_feature_size: float = 5.0 
+    # Whether to use GPU for feature extraction
+    use_gpu: bool = True  
 
     ##################################
     # Params for SIFT
@@ -143,6 +157,14 @@ class OpenSfMConfig:
     guided_extend_image_neighbors: int = 50
     # Maximum number of reprojected neighbors (in the tracks-graph) to check when extending a track within a new image
     guided_extend_feature_neighbors: int = 10
+
+    ##################################
+    # Params for LightGlue matching
+    ##################################
+    # Feature type for LightGlue matcher (disk, superpoint, sift, aliked)
+    lightglue_feature_type: str = "disk"
+    # Match confidence threshold
+    lightglue_confidence_threshold: float = 0.2
 
     ##################################
     # Params for matching
