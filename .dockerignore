@@ -16,6 +16,7 @@
 !setup.cfg
 !setup.py
 !viewer
+!requirements-gpu.txt
 
 # Picking exceptions
 doc/build

@@ -9,7 +9,7 @@ import setuptools
 from sphinx.setup_command import BuildDoc
 from wheel.bdist_wheel import bdist_wheel
 
-VERSION = (0, 5, 2)
+VERSION = (0, 5, 3)  # Bumped version for Kornia integration
 
 
 def version_str(version):
@@ -62,10 +62,10 @@ build_c_extension()
 setuptools.setup(
     name="opensfm",
     version=version_str(VERSION),
-    description="A Structure from Motion library",
+    description="A Structure from Motion library with Kornia integration",
     long_description=open("README.md").read(),
     long_description_content_type="text/markdown",
-    url="https://github.com/mapillary/OpenSfM",
+    url="https://github.com/ASaid7/OpenSfM",
     project_urls={
         "Documentation": "https://docs.opensfm.org/",
     },
@@ -91,7 +91,27 @@ setuptools.setup(
             "data/camera_calibration.yaml",
             "data/bow/bow_hahog_root_uchar_10000.npz",
             "data/bow/bow_hahog_root_uchar_64.npz",
+            "kornia_models/*.pth",  # Added for Kornia pretrained models
         ]
+    },
+    install_requires=[
+        "numpy>=1.19",
+        "scipy>=1.10.0",
+        "networkx>=2.5",
+        "opencv-python",
+        "pyproj>=1.9.5.1",
+        "exifread==2.1.2",
+        "cloudpickle==0.4.0",
+        "xmltodict==0.10.2",
+        "pyyaml>=5.4",
+        "torch>=2.0.0",
+        "kornia>=0.7.0",
+    ],
+    extras_require={
+        "gpu": [
+            "torch>=2.0.0+cu118",
+            "torchvision>=0.15.0+cu118",
+        ],
     },
     cmdclass={
         "bdist_wheel": platform_bdist_wheel,
