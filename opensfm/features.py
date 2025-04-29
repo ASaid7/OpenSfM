@@ -13,8 +13,11 @@ import torch
 import kornia as k
 import kornia.feature as KF
 
+import threading
+
 logger: logging.Logger = logging.getLogger(__name__)
 
+_disk_model_cache = {}
 
 class SemanticData:
     segmentation: np.ndarray
@@ -561,69 +564,71 @@ def extract_features_orb(
 def extract_features_disk(
     image: np.ndarray, config: Dict[str, Any], features_count: int
 ) -> Tuple[np.ndarray, np.ndarray]:
-    global _disk_model_cache
+    global _disk_model_cache, _disk_lock
     
     # Get DISK-specific parameters from config
     disk_weights = config["disk_weights"]
     disk_num_features = config["disk_num_features"]
     disk_threshold = config["disk_threshold"]
     
-    # Prepare the image tensor
-    if image.ndim == 2:  # grayscale image
+    # Process image similarly as before
+    if image.ndim == 2:
         image_tensor = torch.from_numpy(image).float().unsqueeze(0).unsqueeze(0)
-    else:  # RGB image
-        # Convert to RGB and normalize
-        image_rgb = image.transpose(2, 0, 1)  # HWC to CHW
+    else:
+        image_rgb = image.transpose(2, 0, 1)
         image_tensor = torch.from_numpy(image_rgb).float().unsqueeze(0)
         image_tensor = image_tensor / 255.0
     
-    # Move to GPU if available
-    device = torch.device('cuda' if torch.cuda.is_available() and config["use_gpu"] else 'cpu')
-    image_tensor = image_tensor.to(device)
+    # Use a lock to ensure only one process accesses the GPU at a time
+    with _disk_lock:
+        device = torch.device('cuda' if torch.cuda.is_available() and config["use_gpu"] else 'cpu')
+        
+        # Cache model to avoid reloading
+        model_key = f"{disk_weights}_{device}"
+        if model_key not in _disk_model_cache:
+            logger.info(f"Loading DISK model {disk_weights} on {device}")
+            disk = KF.DISK.from_pretrained(disk_weights)
+            disk = disk.to(device)
+            _disk_model_cache[model_key] = disk
+        else:
+            disk = _disk_model_cache[model_key]
+        
+        # Move tensor to device
+        image_tensor = image_tensor.to(device)
+        
+        # Extract features
+        with torch.no_grad():
+            disk.eval()
+            features = disk(image_tensor, 
+                          n=disk_num_features if disk_num_features > 0 else features_count,
+                          score_threshold=disk_threshold,
+                          pad_if_not_divisible=True)
+        
+        # Move results back to CPU before releasing lock
+        keypoints = features[0].keypoints.cpu().numpy()
+        descriptors = features[0].descriptors.cpu().numpy()
+        scores = features[0].detection_scores.cpu().numpy()
+        
+        # Clean up GPU memory
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
     
-    # Initialize DISK model (with caching)
-    model_key = f"{disk_weights}_{device}"
-    if model_key not in _disk_model_cache:
-        logger.info(f"Loading DISK model {disk_weights} on {device}")
-        disk = KF.DISK.from_pretrained(disk_weights)
-        disk = disk.to(device)
-        _disk_model_cache[model_key] = disk
-    else:
-        disk = _disk_model_cache[model_key]
-
-    # Extract features
-    with torch.no_grad():
-        disk.eval()
-        features = disk(image_tensor, 
-                       n=disk_num_features if disk_num_features > 0 else features_count,
-                       score_threshold=disk_threshold,
-                       pad_if_not_divisible=True)
-    
-    # Extract keypoints and descriptors from features
-    keypoints = features[0].keypoints.cpu().numpy()
-    descriptors = features[0].descriptors.cpu().numpy()
-
+    # Process results (outside the lock)
     sizes = np.ones(keypoints.shape[0]) * config.get("disk_default_feature_size", 5.0)
     angles = np.zeros(keypoints.shape[0])
     
     points = np.column_stack([keypoints, sizes[:, np.newaxis], angles[:, np.newaxis]])
     
-    # If we have more keypoints than requested, sort by score (if available) and take top N
-    if "scores" in features and len(points) > features_count:
-        scores = features["scores"][0].cpu().numpy()
+    # If we have more keypoints than requested, sort by score and take top N
+    if scores is not None and len(points) > features_count:
         idx = np.argsort(scores)[-features_count:]
         points = points[idx]
         descriptors = descriptors[idx]
-    
-    # Clean up GPU memory
-    if device.type == 'cuda':
-        torch.cuda.empty_cache()
     
     # Ensure consistency of output types with other extractors
     points = points.astype(float)
     
     return points, descriptors
-
 
 def extract_features(
     image: np.ndarray, config: Dict[str, Any], is_panorama: bool

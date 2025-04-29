@@ -241,7 +241,7 @@ def match_descriptors(
 
     symmetric = "symmetric" if overriden_config["symmetric_matching"] else "one-way"
     logger.debug(
-        "Matching {} and {}.  Matcher: {} ({}) " "T-desc: {:1.3f} Matches: {}".format(
+        "Matching {} and {}. Matcher: {} ({}) " "T-desc: {:1.3f} Matches: {}".format(
             im1,
             im2,
             matcher_type,
@@ -434,12 +434,23 @@ def _match_descriptors_impl(
         else:
             matches = match_brute_force(d1, d2, overriden_config)
     elif matcher_type == "LIGHTGLUE":
+        original_w, original_h = camera1.width, camera1.height
+        max_size = overriden_config["feature_process_size"]  # or feature_process_size_panorama for panoramas
+        resized_w, resized_h = calculate_resized_dimensions(original_w, original_h, max_size)
+        image_size1 = [resized_w, resized_h]  # Width, Height order for LightGlue
+
+        original_w, original_h = camera2.width, camera2.height
+        resized_w, resized_h = calculate_resized_dimensions(original_w, original_h, max_size)
+        image_size2 = [resized_w, resized_h]  # Width, Height order for LightGlue
+
         if symmetric_matching:
             matches = match_lightglue_symmetric(
                 d1,
                 d2,
                 features_data1.points,
                 features_data2.points,
+                image_size1,
+                image_size2,
                 overriden_config,
             )
         else:
@@ -448,6 +459,8 @@ def _match_descriptors_impl(
                 d2,
                 features_data1.points,
                 features_data2.points,
+                image_size1,
+                image_size2,
                 overriden_config,
             )
     else:
@@ -603,7 +616,7 @@ def match(
     robust_matching_min_match = overriden_config["robust_matching_min_match"]
     if len(matches) < robust_matching_min_match:
         logger.debug(
-            "Matching {} and {}.  Matcher: {} ({}) T-desc: {:1.3f} "
+            "Matching {} and {}. Matcher: {} ({}) T-desc: {:1.3f} "
             "Matches: FAILED".format(
                 im1, im2, matcher_type, symmetric, time_2d_matching
             )
@@ -626,7 +639,7 @@ def match(
     time_total = timer() - time_start
 
     logger.debug(
-        "Matching {} and {}.  Matcher: {} ({}) "
+        "Matching {} and {}. Matcher: {} ({}) "
         "T-desc: {:1.3f} T-robust: {:1.3f} T-total: {:1.3f} "
         "Matches: {} Robust: {} Success: {}".format(
             im1,
@@ -826,8 +839,8 @@ def compute_inliers_bearings(
     Args:
         b1, b2: Bearings in the two images.
         R, t: Rotation and translation from the second image to the first.
-              That is the convention and the opposite of many
-              functions in this module.
+             That is the convention and the opposite of many
+             functions in this module.
         threshold: max reprojection error in radians.
     Returns:
         array: Array of boolean indicating inliers/outliers
@@ -923,7 +936,7 @@ def robust_match(
     """Filter matches by fitting a geometric model.
 
     If cameras are perspective without distortion, then the Fundamental
-    matrix is used.  Otherwise, we use the Essential matrix.
+    matrix is used. Otherwise, we use the Essential matrix.
     """
     if (
         camera1.projection_type in ["perspective", "brown"]
@@ -944,11 +957,14 @@ def unfilter_matches(matches, m1, m2) -> np.ndarray:
     i2 = np.flatnonzero(m2)
     return np.array([(i1[match[0]], i2[match[1]]) for match in matches])
 
+
 def match_lightglue(
     d1: np.ndarray,
     d2: np.ndarray,
     p1: np.ndarray,
     p2: np.ndarray,
+    s1: list, 
+    s2: list,
     config: Dict[str, Any],
 ) -> List[Tuple[int, int]]:
     """Match features using LightGlue from Kornia.
@@ -956,6 +972,7 @@ def match_lightglue(
     Args:
         d1, d2: Feature descriptors
         p1, p2: Feature keypoints
+        s1, s2: Image sizes [width, height]
         config: Configuration parameters
     
     Returns:
@@ -977,7 +994,7 @@ def match_lightglue(
     
     # Create LightGlue model
     try:
-        lightglue = LightGlue(feature_type=feature_type)
+        lightglue = LightGlue(feature_type)
         lightglue = lightglue.to(device)
         lightglue.eval()  # Set to evaluation mode
     except Exception as e:
@@ -991,26 +1008,35 @@ def match_lightglue(
         
         kpts1 = torch.from_numpy(p1[:, :2]).to(device)
         kpts2 = torch.from_numpy(p2[:, :2]).to(device)
-        
+
+        # Denormalize keypoints for lightglue
+        kpts1 = denormalize_keypoints(kpts1, *s1)
+        kpts2 = denormalize_keypoints(kpts2, *s2)
+
         # Build feature dictionaries expected by LightGlue
         feats0 = {
-            'keypoints': kpts1.float(),
-            'descriptors': desc1.float(),
-            'image_size': torch.tensor([p1.shape[0], p1.shape[0]]).to(device),  # Approximation
+            'keypoints': kpts1.unsqueeze(0).float(),
+            'descriptors': desc1.unsqueeze(0).float(),
+            'image_size': torch.tensor(s1).view(1, 2).to(device)
         }
         feats1 = {
-            'keypoints': kpts2.float(),
-            'descriptors': desc2.float(),
-            'image_size': torch.tensor([p2.shape[0], p2.shape[0]]).to(device),  # Approximation
+            'keypoints': kpts2.unsqueeze(0).float(),
+            'descriptors': desc2.unsqueeze(0).float(),
+            'image_size': torch.tensor(s2).view(1, 2).to(device)
+        }
+
+        data = {
+            'image0': feats0,
+            'image1': feats1
         }
         
         # Match features
         with torch.no_grad():
-            matches_data = lightglue(feats0, feats1)
+            matches_data = lightglue(data)
         
         # Extract indices and confidences
-        matches_idx = matches_data['matches']
-        confidences = matches_data['confidence']
+        matches_idx = matches_data['matches'][0]
+        confidences = matches_data['scores'][0]
         
         # Filter by confidence threshold
         mask = confidences > confidence_threshold
@@ -1022,21 +1048,24 @@ def match_lightglue(
         # Clean up - move tensors back to CPU and free GPU memory
         if device.type == 'cuda':
             torch.cuda.empty_cache()
-            
+        
         logger.debug(f"LightGlue found {len(matches_list)} matches out of {len(p1)} and {len(p2)} features")
         return matches_list
-        
+    
     except Exception as e:
         logger.error(f"Error during LightGlue matching: {e}")
         if device.type == 'cuda':
             torch.cuda.empty_cache()
         return []
 
+
 def match_lightglue_symmetric(
     d1: np.ndarray,
     d2: np.ndarray,
     p1: np.ndarray,
     p2: np.ndarray,
+    s1: list, 
+    s2: list,
     config: Dict[str, Any],
 ) -> List[Tuple[int, int]]:
     """Match using LightGlue in both directions and keep consistent matches.
@@ -1044,13 +1073,14 @@ def match_lightglue_symmetric(
     Args:
         d1, d2: Feature descriptors
         p1, p2: Feature keypoints
+        s1, s2: size of the input images
         config: Configuration parameters
     
     Returns:
         List of matches as tuples (idx1, idx2)
     """
-    matches_ij = match_lightglue(d1, d2, p1, p2, config)
-    matches_ji = match_lightglue(d2, d1, p2, p1, config)
+    matches_ij = match_lightglue(d1, d2, p1, p2, s1, s2, config)
+    matches_ji = match_lightglue(d2, d1, p2, p1, s2, s1, config)
     matches_ij = [(a, b) for a, b in matches_ij]
     matches_ji = [(b, a) for a, b in matches_ji]
     
@@ -1069,7 +1099,6 @@ def apply_adhoc_filters(
 ) -> List[Tuple[int, int]]:
     """Apply a set of filters functions defined further below
     for removing static data in images.
-
     """
     matches = _non_static_matches(p1, p2, matches)
     matches = _not_on_pano_poles_matches(p1, p2, matches, camera1, camera2)
@@ -1183,3 +1212,41 @@ def _blackvue_valid_mask(p: np.ndarray) -> bool:
     with h = 2160 and w = 3840
     """
     return p[1] < 0.263
+
+
+def calculate_resized_dimensions(original_width: int, original_height: int, max_size: int) -> Tuple[int, int]:
+    """Calculate dimensions after resizing based on max_size parameter.
+    
+    Args:
+        original_width: Width of the original image
+        original_height: Height of the original image
+        max_size: Maximum size parameter used for resizing
+    
+    Returns:
+        Tuple of (width, height) of the resized image
+    """
+    size = max(original_width, original_height)
+    if 0 < max_size < size:
+        resized_width = original_width * max_size // size
+        resized_height = original_height * max_size // size
+        return resized_width, resized_height
+    else:
+        return original_width, original_height
+    
+
+def denormalize_keypoints(norm_coords, width, height):
+    """Convert normalized coordinates to pixel coordinates.
+    
+    Args:
+        norm_coords: Normalized keypoint coordinates
+        width: Image width
+        height: Image height
+        
+    Returns:
+        Keypoints in pixel coordinates
+    """
+    size = max(width, height)
+    p = norm_coords.clone()
+    p[..., 0] = norm_coords[..., 0] * size + width / 2.0 - 0.5
+    p[..., 1] = norm_coords[..., 1] * size + height / 2.0 - 0.5
+    return p
