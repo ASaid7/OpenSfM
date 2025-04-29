@@ -16,8 +16,12 @@ from opensfm import (
 )
 from opensfm.dataset_base import DataSetBase
 
+import torch
+from kornia.feature import LightGlue
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+_lightglue_model_cache = {}
 
 
 def clear_cache() -> None:
@@ -74,6 +78,16 @@ def match_images_with_pairs(
     start = timer()
     logger.info("Matching {} image pairs".format(len(pairs)))
     processes = config_override.get("processes", data.config["processes"])
+    
+    # Check if we're using GPU-based matching
+    matcher_type = config_override.get("matcher_type", data.config["matcher_type"]).upper()
+    is_gpu_matcher = matcher_type in ["LIGHTGLUE"] and config_override.get("use_gpu", True)
+    
+    # Force single process for GPU matchers
+    if is_gpu_matcher:
+        logger.info(f"Using {matcher_type} with GPU - forcing single process mode for stability")
+        processes = 1
+    
     mem_per_process = 512
     jobs_per_process = 2
     processes = context.processes_that_fit_in_memory(processes, mem_per_process)
@@ -978,12 +992,6 @@ def match_lightglue(
     Returns:
         List of matches as tuples (idx1, idx2)
     """
-    try:
-        import torch
-        from kornia.feature import LightGlue
-    except ImportError:
-        logger.error("LightGlue matching requires Kornia and PyTorch. Please install them.")
-        return []
     
     # Check if CUDA is available
     device = torch.device('cuda' if torch.cuda.is_available() and torch.cuda.is_initialized() else 'cpu')
@@ -992,14 +1000,20 @@ def match_lightglue(
     feature_type = config.get("lightglue_feature_type", "disk")
     confidence_threshold = config.get("lightglue_confidence_threshold", 0.2)
     
+    # Use model caching
+    model_key = f"lightglue_{feature_type}_{device}"
     # Create LightGlue model
-    try:
-        lightglue = LightGlue(feature_type)
-        lightglue = lightglue.to(device)
-        lightglue.eval()  # Set to evaluation mode
-    except Exception as e:
-        logger.error(f"Failed to initialize LightGlue model: {e}")
-        return []
+    if model_key not in _lightglue_model_cache:
+        try:
+            lightglue = LightGlue(feature_type)
+            lightglue = lightglue.to(device)
+            lightglue.eval()  # Set to evaluation mode
+            _lightglue_model_cache[model_key] = lightglue
+        except Exception as e:
+            logger.error(f"Failed to initialize LightGlue model: {e}")
+            return []
+    else:
+        lightglue = _lightglue_model_cache[model_key]
     
     try:
         # Convert the descriptors and keypoints to torch tensors
