@@ -171,6 +171,12 @@ class OpenSfMConfig:
     lightglue_feature_type: str = "disk"
     # Match confidence threshold
     lightglue_confidence_threshold: float = 0.2
+    # Enable batch processing for LightGlue (processes multiple pairs at once)
+    lightglue_batch_processing: bool = True
+    # Maximum batch size for LightGlue
+    lightglue_max_batch_size: int = 16
+    # Timeout in seconds to wait for batch assembly before processing
+    lightglue_batch_timeout: float = 0.5
 
     ##################################
     # Params for matching

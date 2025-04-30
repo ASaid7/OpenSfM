@@ -17,7 +17,17 @@ from opensfm import (
 from opensfm.dataset_base import DataSetBase
 
 import torch
-from kornia.feature import LightGlue
+from kornia.feature import LightGlue, LightGlueMatcher
+import kornia as K
+import kornia.feature as KF
+
+import queue
+import threading
+from collections import defaultdict
+
+# Add these global variables at the top of matching.py (after existing globals)
+_lightglue_model_cache = {}  # This already exists
+_lightglue_batch_lock = threading.RLock()  # New lock for batch processing
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -79,20 +89,37 @@ def match_images_with_pairs(
     logger.info("Matching {} image pairs".format(len(pairs)))
     processes = config_override.get("processes", data.config["processes"])
     
-    # Check if we're using GPU-based matching
-    matcher_type = config_override.get("matcher_type", data.config["matcher_type"]).upper()
-    is_gpu_matcher = matcher_type in ["LIGHTGLUE"] and config_override.get("use_gpu", True)
+    # Check if we're using LightGlue matcher with batch processing enabled
+    overriden_config = data.config.copy()
+    overriden_config.update(config_override)
+    matcher_type = overriden_config["matcher_type"].upper()
+    use_symmetric = overriden_config.get("symmetric_matching", True)
+    use_batch_lightglue = (
+        matcher_type == "LIGHTGLUE" 
+        and overriden_config.get("lightglue_batch_processing", True)
+        and overriden_config.get("use_gpu", True)
+    )
     
-    # Force single process for GPU matchers
-    if is_gpu_matcher:
-        logger.info(f"Using {matcher_type} with GPU - forcing single process mode for stability")
+    if use_batch_lightglue:
+        # Use batch processing for LightGlue
+        logger.info(f"Using LightGlue with batch processing - forcing single process mode for stability")
         processes = 1
+        
+        # Use symmetric or non-symmetric batch processing based on configuration
+        if use_symmetric:
+            logger.info("Using symmetric batch matching")
+            matches = match_lightglue_batch(args, overriden_config, symmetric=True)
+        else:
+            logger.info("Using non-symmetric batch matching")
+            matches = match_lightglue_batch(args, overriden_config, symmetric=False)
+    else:
+        # Use standard parallel processing for other matchers
+        mem_per_process = 512
+        jobs_per_process = 2
+        processes = context.processes_that_fit_in_memory(processes, mem_per_process)
+        logger.info("Computing pair matching with %d processes" % processes)
+        matches = context.parallel_map(match_unwrap_args, args, processes, jobs_per_process)
     
-    mem_per_process = 512
-    jobs_per_process = 2
-    processes = context.processes_that_fit_in_memory(processes, mem_per_process)
-    logger.info("Computing pair matching with %d processes" % processes)
-    matches = context.parallel_map(match_unwrap_args, args, processes, jobs_per_process)
     logger.info(
         "Matched {} pairs {} in {} seconds ({} seconds/pair).".format(
             len(pairs),
@@ -1264,3 +1291,323 @@ def denormalize_keypoints(norm_coords, width, height):
     p[..., 0] = norm_coords[..., 0] * size + width / 2.0 - 0.5
     p[..., 1] = norm_coords[..., 1] * size + height / 2.0 - 0.5
     return p
+
+def match_lightglue_batch(
+    args: List[Tuple],
+    config: Dict[str, Any],
+    symmetric: bool = False
+) -> List[Tuple[str, str, np.ndarray]]:
+    """Process multiple image pairs with LightGlue in batches.
+    
+    Args:
+        args: List of match arguments
+        config: Configuration dictionary
+        symmetric: Whether to perform symmetric matching
+        
+    Returns:
+        List of match results (im1, im2, matches)
+    """
+    global _lightglue_model_cache, _lightglue_batch_lock
+    
+    if not args:
+        return []
+    
+    # Extract parameters from config
+    max_batch_size = config.get("lightglue_max_batch_size", 16)
+    batch_timeout = config.get("lightglue_batch_timeout", 0.5)
+    confidence_threshold = config.get("lightglue_confidence_threshold", 0.2)
+    feature_type = config.get("lightglue_feature_type", "disk")
+    
+    # Check if CUDA is available
+    device = torch.device('cuda' if torch.cuda.is_available() and torch.cuda.is_initialized() else 'cpu')
+    
+    # If no GPU available, fall back to regular processing
+    if device.type != 'cuda':
+        logger.warning("GPU not available. Falling back to regular processing.")
+        return [match_unwrap_args(arg) for arg in args]
+    
+    # Initialize LightGlue model with lock to ensure thread safety
+    with _lightglue_batch_lock:
+        # Create/get LightGlue model
+        model_key = f"lightglue_{feature_type}_{device}"
+        if model_key not in _lightglue_model_cache:
+            try:
+                lightglue = LightGlueMatcher(feature_type, params={"width_confidence": -1}).eval().to(device)
+                _lightglue_model_cache[model_key] = lightglue
+            except Exception as e:
+                logger.error(f"Failed to initialize LightGlue model: {e}")
+                # Fall back to regular processing
+                return [match_unwrap_args(arg) for arg in args]
+        else:
+            lightglue = _lightglue_model_cache[model_key]
+    
+    results = []
+    
+    # Create batches
+    current_batch = []
+    
+    # Process all pairs in batches
+    for i, arg in enumerate(args):
+        current_batch.append(i)
+        
+        # Process batch if it reaches max size
+        if len(current_batch) >= max_batch_size:
+            process_batch_indices(args, current_batch, lightglue, device, config, results, symmetric)
+            current_batch = []
+    
+    # Process remaining items in the last batch
+    if current_batch:
+        process_batch_indices(args, current_batch, lightglue, device, config, results, symmetric)
+    
+    return results
+
+def process_batch_indices(
+    args: List[Tuple],
+    batch_indices: List[int],
+    lightglue_model: Any,
+    device: torch.device,
+    config: Dict[str, Any],
+    results: List[Tuple[str, str, np.ndarray]],
+    symmetric: bool = False
+) -> None:
+    """Process a batch of image pairs with LightGlue.
+    
+    Args:
+        args: List of match arguments
+        batch_indices: Indices of pairs to process in this batch
+        lightglue_model: LightGlue model
+        device: Torch device
+        config: Configuration dictionary
+        results: List to append results to
+        symmetric: Whether to perform symmetric matching
+    """
+    global _lightglue_batch_lock
+    
+    logger.debug(f"Processing LightGlue batch of {len(batch_indices)} pairs" + 
+                 (" with symmetric matching" if symmetric else ""))
+    confidence_threshold = config.get("lightglue_confidence_threshold", 0.2)
+    
+    # Extract feature data for each pair in the batch
+    batch_data = []
+    
+    for idx in batch_indices:
+        im1, im2, cameras, exifs, data, config_override, poses = args[idx]
+        
+        try:
+            # Get camera models
+            camera1 = cameras[exifs[im1]["camera"]]
+            camera2 = cameras[exifs[im2]["camera"]]
+            
+            # Load features
+            segmentation_in_descriptor = config.get("matching_use_segmentation", False)
+            features_data1 = feature_loader.instance.load_all_data(
+                data, im1, masked=True, segmentation_in_descriptor=segmentation_in_descriptor
+            )
+            features_data2 = feature_loader.instance.load_all_data(
+                data, im2, masked=True, segmentation_in_descriptor=segmentation_in_descriptor
+            )
+            
+            if (
+                features_data1 is None or len(features_data1.points) < 2 or 
+                features_data2 is None or len(features_data2.points) < 2
+            ):
+                # Skip this pair if features are missing
+                results.append((im1, im2, np.array([])))
+                continue
+                
+            d1 = features_data1.descriptors
+            d2 = features_data2.descriptors
+            p1 = features_data1.points
+            p2 = features_data2.points
+            
+            if d1 is None or d2 is None:
+                # Skip this pair if descriptors are missing
+                results.append((im1, im2, np.array([])))
+                continue
+            
+            # Calculate image sizes
+            original_w1, original_h1 = camera1.width, camera1.height
+            max_size = config.get("feature_process_size", 2048)
+            size1 = calculate_resized_dimensions(original_w1, original_h1, max_size)
+            
+            original_w2, original_h2 = camera2.width, camera2.height
+            size2 = calculate_resized_dimensions(original_w2, original_h2, max_size)
+            
+            # Add to batch data
+            batch_data.append({
+                'pair_idx': len(batch_data),  # Index in this batch
+                'im1': im1,
+                'im2': im2,
+                'd1': d1,
+                'd2': d2,
+                'p1': p1,
+                'p2': p2,
+                'size1': size1,
+                'size2': size2,
+                'camera1': camera1,
+                'camera2': camera2,
+                'data': data,
+                'exifs': exifs
+            })
+        
+        except Exception as e:
+            logger.error(f"Error preparing batch data for {im1}-{im2}: {e}")
+            results.append((im1, im2, np.array([])))
+    
+    if not batch_data:
+        return
+    
+    # Process the entire batch at once
+    with _lightglue_batch_lock:
+        try:
+            with torch.no_grad():
+                # Prepare batch tensors
+                all_desc1 = []
+                all_desc2 = []
+                all_lafs1 = []
+                all_lafs2 = []
+                all_hw1 = []
+                all_hw2 = []
+                
+                # First pass: convert to tensors
+                for item in batch_data:
+                    # Convert descriptors to tensors
+                    desc1 = torch.from_numpy(item['d1']).float().to(device)
+                    desc2 = torch.from_numpy(item['d2']).float().to(device)
+                    
+                    # Prepare keypoints
+                    kpts1 = torch.from_numpy(item['p1'][:, :2]).float().to(device)
+                    kpts2 = torch.from_numpy(item['p2'][:, :2]).float().to(device)
+                    
+                    # Denormalize keypoints
+                    kpts1_denorm = denormalize_keypoints(kpts1, item['size1'][0], item['size1'][1])
+                    kpts2_denorm = denormalize_keypoints(kpts2, item['size2'][0], item['size2'][1])
+                    
+                    # Convert to LAFs (Local Affine Frames)
+                    lafs1 = KF.laf_from_center_scale_ori(
+                        kpts1_denorm.unsqueeze(0),  # Add batch dimension
+                        torch.ones(1, kpts1_denorm.shape[0], 1, 1, device=device)  # Default scale
+                    )
+                    lafs2 = KF.laf_from_center_scale_ori(
+                        kpts2_denorm.unsqueeze(0),  # Add batch dimension
+                        torch.ones(1, kpts2_denorm.shape[0], 1, 1, device=device)  # Default scale
+                    )
+                    
+                    # Add to batch lists
+                    all_desc1.append(desc1)
+                    all_desc2.append(desc2)
+                    all_lafs1.append(lafs1)
+                    all_lafs2.append(lafs2)
+                    all_hw1.append(tuple(item['size1']))
+                    all_hw2.append(tuple(item['size2']))
+
+                # Stack tensors
+                desc1 = torch.stack(all_desc1, dim=0)
+                desc2 = torch.stack(all_desc2, dim=0)
+                lafs1 = torch.stack(all_lafs1, dim=0)
+                lafs2 = torch.stack(all_lafs2, dim=0)
+                hw1 = torch.stack(all_hw1, dim=0)
+                hw2 = torch.stack(all_hw2, dim=0)
+                
+                # --- FORWARD DIRECTION (image1 -> image2) ---
+                batch_dists_forward, batch_idxs_forward = lightglue_model(
+                    desc1, desc2, 
+                    lafs1, lafs2,
+                    hw1=hw1,
+                    hw2=hw2
+                )
+                
+                # For symmetric matching, also compute backward direction
+                if symmetric:
+                    # --- BACKWARD DIRECTION (image2 -> image1) ---
+                    batch_dists_backward, batch_idxs_backward = lightglue_model(
+                        desc2, desc1, 
+                        lafs2, lafs1,
+                        hw1=hw2,
+                        hw2=hw1
+                    )
+                
+                # Process results for each pair
+                for i, item in enumerate(batch_data):
+                    im1, im2 = item['im1'], item['im2']
+                    p1, p2 = item['p1'], item['p2']
+                    
+                    try:
+                        if symmetric:
+                            # Extract matches for forward direction
+                            matches_forward = set()
+                            if i < len(batch_idxs_forward) and batch_idxs_forward[i] is not None and batch_idxs_forward[i].shape[0] > 0:
+                                matches_idx = batch_idxs_forward[i]
+                                
+                                # Filter by confidence threshold if available
+                                if i < len(batch_dists_forward) and batch_dists_forward[i] is not None and batch_dists_forward[i].numel() > 0:
+                                    confidence = batch_dists_forward[i]
+                                    mask = confidence > confidence_threshold
+                                    matches_idx = matches_idx[mask]
+                                
+                                # Convert to set of tuples
+                                matches_forward = {(int(a), int(b)) for a, b in matches_idx.cpu().numpy()}
+                            
+                            # Extract matches for backward direction (swap indices)
+                            matches_backward = set()
+                            if i < len(batch_idxs_backward) and batch_idxs_backward[i] is not None and batch_idxs_backward[i].shape[0] > 0:
+                                matches_idx = batch_idxs_backward[i]
+                                
+                                # Filter by confidence threshold if available
+                                if i < len(batch_dists_backward) and batch_dists_backward[i] is not None and batch_dists_backward[i].numel() > 0:
+                                    confidence = batch_dists_backward[i]
+                                    mask = confidence > confidence_threshold
+                                    matches_idx = matches_idx[mask]
+                                
+                                # Convert to set of tuples (swapping a and b for backward direction)
+                                matches_backward = {(int(b), int(a)) for a, b in matches_idx.cpu().numpy()}
+                            
+                            # Find matches that appear in both directions
+                            matches_list = list(matches_forward.intersection(matches_backward))
+                            
+                            logger.debug(f"LightGlue symmetric found {len(matches_list)} matches between {im1} and {im2}")
+                        else:
+                            # Extract matches for this pair
+                            matches_list = []
+                            if i < len(batch_idxs_forward) and batch_idxs_forward[i] is not None and batch_idxs_forward[i].shape[0] > 0:
+                                # Get matches
+                                matches_idx = batch_idxs_forward[i]
+                                
+                                # Filter by confidence threshold if dists contains confidence scores
+                                if i < len(batch_dists_forward) and batch_dists_forward[i] is not None and batch_dists_forward[i].numel() > 0:
+                                    confidence = batch_dists_forward[i]
+                                    mask = confidence > confidence_threshold
+                                    matches_idx = matches_idx[mask]
+                                
+                                # Convert to list of tuples
+                                matches_list = [(int(i), int(j)) for i, j in matches_idx.cpu().numpy()]
+                                
+                                logger.debug(f"LightGlue found {len(matches_list)} matches between {im1} and {im2}")
+                        
+                        # Get robust matches
+                        if len(matches_list) > 0:
+                            robust_matches = _match_robust_impl(
+                                im1, im2, p1, p2, np.array(matches_list), 
+                                item['camera1'], item['camera2'], 
+                                item['data'], config
+                            )
+                        else:
+                            robust_matches = np.array([])
+                        
+                        results.append((im1, im2, robust_matches))
+                    
+                    except Exception as e:
+                        logger.error(f"Error processing batch match result for {im1}-{im2}: {e}")
+                        results.append((im1, im2, np.array([])))
+                
+                # Clean up GPU memory
+                if device.type == 'cuda':
+                    torch.cuda.empty_cache()
+        
+        except Exception as e:
+            logger.error(f"Error in batch processing LightGlue: {e}")
+            # Add empty matches for all pairs in this batch
+            for item in batch_data:
+                im1, im2 = item['im1'], item['im2']
+                if not any(r[0] == im1 and r[1] == im2 for r in results):
+                    results.append((im1, im2, np.array([])))
