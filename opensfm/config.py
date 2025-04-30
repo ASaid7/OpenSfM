@@ -47,7 +47,13 @@ class OpenSfMConfig:
     # Default size for detected features
     disk_default_feature_size: float = 5.0 
     # Whether to use GPU for feature extraction
-    use_gpu: bool = True  
+    use_gpu: bool = True 
+    # Enable batch processing for DISK
+    disk_batch_processing: bool = True    
+    # Maximum batch size
+    disk_max_batch_size: int = 16
+    # Maximum wait time for batch completion
+    disk_batch_timeout: float = 0.5
 
     ##################################
     # Params for SIFT
