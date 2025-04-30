@@ -18,6 +18,7 @@ import threading
 logger: logging.Logger = logging.getLogger(__name__)
 
 _disk_model_cache = {}
+_disk_lock = threading.RLock()
 
 class SemanticData:
     segmentation: np.ndarray
@@ -740,3 +741,114 @@ def build_flann_index(descriptors: np.ndarray, config: Dict[str, Any]) -> Any:
         )
 
     return context.flann_Index(descriptors, flann_params)
+
+def extract_features_disk_batch(
+    images_batch: List[np.ndarray],
+    config: Dict[str, Any],
+    features_counts: List[int]
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """Extract features from a batch of images using DISK.
+    
+    This function groups images by size and processes each group as a batch.
+    """
+    global _disk_model_cache, _disk_lock
+    
+    if not images_batch:
+        return []
+    
+    # Get DISK-specific parameters from config
+    disk_weights = config["disk_weights"]
+    disk_num_features = config["disk_num_features"]
+    disk_threshold = config["disk_threshold"]
+    
+    # Group images by size for efficient batching
+    size_groups = {}
+    for i, image in enumerate(images_batch):
+        size = image.shape if image.ndim == 3 else (*image.shape, 1)
+        if size not in size_groups:
+            size_groups[size] = []
+        size_groups[size].append((i, image))
+    
+    results = [None] * len(images_batch)
+    
+    # Use a lock to ensure only one process accesses the GPU at a time
+    with _disk_lock:
+        device = torch.device('cuda' if torch.cuda.is_available() and config["use_gpu"] else 'cpu')
+        
+        # Cache model to avoid reloading
+        model_key = f"{disk_weights}_{device}"
+        if model_key not in _disk_model_cache:
+            logger.info(f"Loading DISK model {disk_weights} on {device}")
+            disk = KF.DISK.from_pretrained(disk_weights)
+            disk = disk.to(device)
+            _disk_model_cache[model_key] = disk
+        else:
+            disk = _disk_model_cache[model_key]
+        
+        # Process each size group as a batch
+        with torch.no_grad():
+            disk.eval()
+            for size, group in size_groups.items():
+                try:
+                    indices = [idx for idx, _ in group]
+                    h, w = size[0], size[1]
+                    group_size = len(group)
+                    
+                    # Create batch tensor
+                    if size[2] == 1:  # Grayscale
+                        batch_tensor = torch.zeros((group_size, 1, h, w), dtype=torch.float32)
+                        for i, (_, img) in enumerate(group):
+                            if img.ndim == 2:
+                                batch_tensor[i, 0] = torch.from_numpy(img).float()
+                            else:
+                                batch_tensor[i, 0] = torch.from_numpy(img[:, :, 0]).float()
+                    else:  # RGB
+                        batch_tensor = torch.zeros((group_size, 3, h, w), dtype=torch.float32)
+                        for i, (_, img) in enumerate(group):
+                            img_rgb = img.transpose(2, 0, 1)
+                            batch_tensor[i] = torch.from_numpy(img_rgb).float() / 255.0
+                    
+                    # Move batch to device
+                    batch_tensor = batch_tensor.to(device)
+                    
+                    # Process batch
+                    n_features = disk_num_features if disk_num_features > 0 else max([features_counts[idx] for idx in indices])
+                    batch_features = disk(
+                        batch_tensor, 
+                        n=n_features,
+                        score_threshold=disk_threshold,
+                        pad_if_not_divisible=True
+                    )
+                    
+                    # Process results for each image in batch
+                    for batch_idx, orig_idx in enumerate(indices):
+                        keypoints = batch_features[batch_idx].keypoints.cpu().numpy()
+                        descriptors = batch_features[batch_idx].descriptors.cpu().numpy()
+                        scores = batch_features[batch_idx].detection_scores.cpu().numpy()
+                        
+                        # Create points array with size and angle
+                        sizes = np.ones(keypoints.shape[0]) * config.get("disk_default_feature_size", 5.0)
+                        angles = np.zeros(keypoints.shape[0])
+                        points = np.column_stack([keypoints, sizes[:, np.newaxis], angles[:, np.newaxis]])
+                        
+                        # Filter by score if needed
+                        if scores is not None and len(points) > features_counts[orig_idx]:
+                            idx = np.argsort(scores)[-features_counts[orig_idx]:]
+                            points = points[idx]
+                            descriptors = descriptors[idx]
+                        
+                        # Ensure consistent types
+                        points = points.astype(float)
+                        
+                        results[orig_idx] = (points, descriptors)
+                
+                except Exception as e:
+                    logger.error(f"Error processing batch for size {size}: {e}")
+                    for idx in indices:
+                        results[idx] = (np.zeros((0, 4), dtype=float), np.zeros((0, 0), dtype=float))
+            
+            # Clean up GPU memory
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
+    
+    return results
