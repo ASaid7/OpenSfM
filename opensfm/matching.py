@@ -17,7 +17,7 @@ from opensfm import (
 from opensfm.dataset_base import DataSetBase
 
 import torch
-from kornia.feature import LightGlue, LightGlueMatcher
+from kornia.feature import LightGlue
 import kornia as K
 import kornia.feature as KF
 
@@ -1319,7 +1319,7 @@ def match_lightglue_batch(
     feature_type = config.get("lightglue_feature_type", "disk")
     
     # Check if CUDA is available
-    device = torch.device('cuda' if torch.cuda.is_available() and torch.cuda.is_initialized() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
     # If no GPU available, fall back to regular processing
     if device.type != 'cuda':
@@ -1332,7 +1332,7 @@ def match_lightglue_batch(
         model_key = f"lightglue_{feature_type}_{device}"
         if model_key not in _lightglue_model_cache:
             try:
-                lightglue = LightGlueMatcher(feature_type, params={"width_confidence": -1}).eval().to(device)
+                lightglue = LightGlue(feature_type, width_confidence = -1, filter_threshold=confidence_threshold).eval().to(device).half()
                 _lightglue_model_cache[model_key] = lightglue
             except Exception as e:
                 logger.error(f"Failed to initialize LightGlue model: {e}")
@@ -1464,68 +1464,99 @@ def process_batch_indices(
                 # Prepare batch tensors
                 all_desc1 = []
                 all_desc2 = []
-                all_lafs1 = []
-                all_lafs2 = []
+                all_kpts1 = []
+                all_kpts2 = []
                 all_hw1 = []
                 all_hw2 = []
                 
                 # First pass: convert to tensors
                 for item in batch_data:
                     # Convert descriptors to tensors
-                    desc1 = torch.from_numpy(item['d1']).float().to(device)
-                    desc2 = torch.from_numpy(item['d2']).float().to(device)
+                    desc1 = torch.from_numpy(item['d1']).float().to(device).half()
+                    desc2 = torch.from_numpy(item['d2']).float().to(device).half()
                     
                     # Prepare keypoints
-                    kpts1 = torch.from_numpy(item['p1'][:, :2]).float().to(device)
-                    kpts2 = torch.from_numpy(item['p2'][:, :2]).float().to(device)
+                    kpts1 = torch.from_numpy(item['p1'][:, :2]).float().to(device).half()
+                    kpts2 = torch.from_numpy(item['p2'][:, :2]).float().to(device).half()
                     
                     # Denormalize keypoints
                     kpts1_denorm = denormalize_keypoints(kpts1, item['size1'][0], item['size1'][1])
                     kpts2_denorm = denormalize_keypoints(kpts2, item['size2'][0], item['size2'][1])
                     
-                    # Convert to LAFs (Local Affine Frames)
-                    lafs1 = KF.laf_from_center_scale_ori(
-                        kpts1_denorm.unsqueeze(0),  # Add batch dimension
-                        torch.ones(1, kpts1_denorm.shape[0], 1, 1, device=device)  # Default scale
-                    )
-                    lafs2 = KF.laf_from_center_scale_ori(
-                        kpts2_denorm.unsqueeze(0),  # Add batch dimension
-                        torch.ones(1, kpts2_denorm.shape[0], 1, 1, device=device)  # Default scale
-                    )
                     
                     # Add to batch lists
                     all_desc1.append(desc1)
                     all_desc2.append(desc2)
-                    all_lafs1.append(lafs1)
-                    all_lafs2.append(lafs2)
-                    all_hw1.append(tuple(item['size1']))
-                    all_hw2.append(tuple(item['size2']))
+                    all_kpts1.append(kpts1_denorm.half())
+                    all_kpts2.append(kpts2_denorm.half())
+                    all_hw1.append(torch.tensor(item['size1']))
+                    all_hw2.append(torch.tensor(item['size2']))
 
-                # Stack tensors
-                desc1 = torch.stack(all_desc1, dim=0)
-                desc2 = torch.stack(all_desc2, dim=0)
-                lafs1 = torch.stack(all_lafs1, dim=0)
-                lafs2 = torch.stack(all_lafs2, dim=0)
+                # Find maximum number of features in this batch
+                max_features1 = max(d.shape[0] for d in all_desc1)
+                max_features2 = max(d.shape[0] for d in all_desc2)
+
+                # Pad all descriptors and keypoints to the maximum size
+                padded_desc1 = []
+                padded_desc2 = []
+                padded_kpts1 = []
+                padded_kpts2 = []
+
+                for i, (d1, d2, k1, k2) in enumerate(zip(all_desc1, all_desc2, all_kpts1, all_kpts2)):
+                    # Pad descriptors (add zeros)
+                    if d1.shape[0] < max_features1:
+                        pad_size = max_features1 - d1.shape[0]
+                        pad_desc = torch.zeros((pad_size, d1.shape[1]), dtype=d1.dtype, device=d1.device)
+                        d1_padded = torch.cat([d1, pad_desc], dim=0)
+                        
+                        # Also pad keypoints (add invalid points that won't match)
+                        pad_kpts = torch.full((pad_size, k1.shape[1]), 0.0, dtype=k1.dtype, device=k1.device)
+                        k1_padded = torch.cat([k1, pad_kpts], dim=0)
+                    else:
+                        d1_padded = d1
+                        k1_padded = k1
+                    
+                    # Same for the second image
+                    if d2.shape[0] < max_features2:
+                        pad_size = max_features2 - d2.shape[0]
+                        pad_desc = torch.zeros((pad_size, d2.shape[1]), dtype=d2.dtype, device=d2.device)
+                        d2_padded = torch.cat([d2, pad_desc], dim=0)
+                        
+                        pad_kpts = torch.full((pad_size, k2.shape[1]), -1.0, dtype=k2.dtype, device=k2.device)
+                        k2_padded = torch.cat([k2, pad_kpts], dim=0)
+                    else:
+                        d2_padded = d2
+                        k2_padded = k2
+                    
+                    padded_desc1.append(d1_padded)
+                    padded_desc2.append(d2_padded)
+                    padded_kpts1.append(k1_padded)
+                    padded_kpts2.append(k2_padded)
+
+                # Stack padded tensors
+                desc1 = torch.stack(padded_desc1, dim=0)
+                desc2 = torch.stack(padded_desc2, dim=0)
+                kpts1 = torch.stack(padded_kpts1, dim=0)
+                kpts2 = torch.stack(padded_kpts2, dim=0)
                 hw1 = torch.stack(all_hw1, dim=0)
                 hw2 = torch.stack(all_hw2, dim=0)
                 
+                img0 = {'keypoints':kpts1,
+                        'descriptors':desc1,
+                        'image_size': hw1}
+                img1 = {'keypoints':kpts2,
+                        'descriptors':desc2,
+                        'image_size': hw2}
+                data = {'image0':img0, 'image1':img1}
                 # --- FORWARD DIRECTION (image1 -> image2) ---
-                batch_dists_forward, batch_idxs_forward = lightglue_model(
-                    desc1, desc2, 
-                    lafs1, lafs2,
-                    hw1=hw1,
-                    hw2=hw2
-                )
-                
+                forward_data = lightglue_model(data)
+                batch_idxs_forward = forward_data['matches']
                 # For symmetric matching, also compute backward direction
                 if symmetric:
                     # --- BACKWARD DIRECTION (image2 -> image1) ---
-                    batch_dists_backward, batch_idxs_backward = lightglue_model(
-                        desc2, desc1, 
-                        lafs2, lafs1,
-                        hw1=hw2,
-                        hw2=hw1
-                    )
+                    data_bw = {'image0':img1, 'image1':img0}
+                    backward_data = lightglue_model(data_bw)
+                    batch_idxs_backward = backward_data['matches']
                 
                 # Process results for each pair
                 for i, item in enumerate(batch_data):
@@ -1539,12 +1570,6 @@ def process_batch_indices(
                             if i < len(batch_idxs_forward) and batch_idxs_forward[i] is not None and batch_idxs_forward[i].shape[0] > 0:
                                 matches_idx = batch_idxs_forward[i]
                                 
-                                # Filter by confidence threshold if available
-                                if i < len(batch_dists_forward) and batch_dists_forward[i] is not None and batch_dists_forward[i].numel() > 0:
-                                    confidence = batch_dists_forward[i]
-                                    mask = confidence > confidence_threshold
-                                    matches_idx = matches_idx[mask]
-                                
                                 # Convert to set of tuples
                                 matches_forward = {(int(a), int(b)) for a, b in matches_idx.cpu().numpy()}
                             
@@ -1552,12 +1577,6 @@ def process_batch_indices(
                             matches_backward = set()
                             if i < len(batch_idxs_backward) and batch_idxs_backward[i] is not None and batch_idxs_backward[i].shape[0] > 0:
                                 matches_idx = batch_idxs_backward[i]
-                                
-                                # Filter by confidence threshold if available
-                                if i < len(batch_dists_backward) and batch_dists_backward[i] is not None and batch_dists_backward[i].numel() > 0:
-                                    confidence = batch_dists_backward[i]
-                                    mask = confidence > confidence_threshold
-                                    matches_idx = matches_idx[mask]
                                 
                                 # Convert to set of tuples (swapping a and b for backward direction)
                                 matches_backward = {(int(b), int(a)) for a, b in matches_idx.cpu().numpy()}
@@ -1572,13 +1591,7 @@ def process_batch_indices(
                             if i < len(batch_idxs_forward) and batch_idxs_forward[i] is not None and batch_idxs_forward[i].shape[0] > 0:
                                 # Get matches
                                 matches_idx = batch_idxs_forward[i]
-                                
-                                # Filter by confidence threshold if dists contains confidence scores
-                                if i < len(batch_dists_forward) and batch_dists_forward[i] is not None and batch_dists_forward[i].numel() > 0:
-                                    confidence = batch_dists_forward[i]
-                                    mask = confidence > confidence_threshold
-                                    matches_idx = matches_idx[mask]
-                                
+
                                 # Convert to list of tuples
                                 matches_list = [(int(i), int(j)) for i, j in matches_idx.cpu().numpy()]
                                 

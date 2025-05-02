@@ -376,7 +376,7 @@ def run_detection_batch(queue: queue.Queue, config: Dict[str, Any]):
         is_pano_batch = [is_high_res_panorama(item[4], item[0], item[1]) for item in batch_data]
         
         # Process batch
-        results = extract_features_disk_batch(images_batch, config, feature_counts)
+        results = features.extract_features_disk_batch(images_batch, config, feature_counts)
         
         # Save results for each image
         for i, ((image, _, segmentation_array, instances_array, data, force), result, is_pano) in enumerate(zip(batch_data, results, is_pano_batch)):
@@ -437,7 +437,7 @@ def run_detection_batch(queue: queue.Queue, config: Dict[str, Any]):
                 semantic_data = None
                 
             # Apply normalization
-            p_sorted, f_sorted, c_sorted = normalize_features(p_sorted, f_sorted, c_sorted, w, h)
+            p_sorted, f_sorted, c_sorted = features.normalize_features(p_sorted, f_sorted, c_sorted, w, h)
             
             # Save features data
             features_data = features.FeaturesData(p_sorted, f_sorted, c_sorted, semantic_data)
